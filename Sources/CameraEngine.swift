@@ -158,8 +158,8 @@ final class CameraEngine: NSObject, ObservableObject {
                                  : "启动失败，可能被其他 App 占用"
                 self.debugText = String(format: "hardwareCost %.2f · 画质上限 %@ · 实况支持 %@",
                                         Double(cost),
-                                        qualityName(photoOutput.maxPhotoQualityPrioritization),
-                                        photoOutput.isLivePhotoCaptureSupported ? "是" : "否")
+                                        self.qualityName(self.photoOutput.maxPhotoQualityPrioritization),
+                                        self.photoOutput.isLivePhotoCaptureSupported ? "是" : "否")
                 if ok && self.livePhoto && !self.livePhotoSupported {
                     self.hint = "已启动（此配置不支持实况，拍普通照片）"
                 }
