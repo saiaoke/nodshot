@@ -156,7 +156,10 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.running = ok
                 self.hint = ok ? (self.dualCamera ? "已启动，点头即可拍照" : "已启动（单摄模式，只能试触发不能存图）")
                                  : "启动失败，可能被其他 App 占用"
-                self.debugText = String(format: "hardwareCost %.2f", Double(cost))
+                self.debugText = String(format: "hardwareCost %.2f · 画质上限 %@ · 实况支持 %@",
+                                        Double(cost),
+                                        qualityName(photoOutput.maxPhotoQualityPrioritization),
+                                        photoOutput.isLivePhotoCaptureSupported ? "是" : "否")
                 if ok && self.livePhoto && !self.livePhotoSupported {
                     self.hint = "已启动（此配置不支持实况，拍普通照片）"
                 }
@@ -308,7 +311,9 @@ final class CameraEngine: NSObject, ObservableObject {
             return
         }
         let settings = AVCapturePhotoSettings()
-        settings.photoQualityPrioritization = .quality
+        // 自动用当前配置允许的最高画质：系统允许 .quality 就用 .quality，
+        // 不允许（多摄模式限制）就自动落到系统上限。这是苹果官方示例的标准写法。
+        settings.photoQualityPrioritization = photoOutput.maxPhotoQualityPrioritization
 
         // 实况图：照片 + 约 3 秒动态
         let useLive = livePhoto && livePhotoSupported && photoOutput.isLivePhotoCaptureEnabled
@@ -325,6 +330,15 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func setHint(_ text: String) {
         DispatchQueue.main.async { if self.hint != text { self.hint = text } }
+    }
+
+    private func qualityName(_ q: AVCapturePhotoOutput.QualityPrioritization) -> String {
+        switch q {
+        case .speed: return "speed"
+        case .balanced: return "balanced"
+        case .quality: return "quality"
+        @unknown default: return String(q.rawValue)
+        }
     }
 }
 
