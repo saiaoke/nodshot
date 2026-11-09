@@ -55,6 +55,8 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published private(set) var dualCamera = false
     @Published private(set) var debugText: String = ""
     @Published private(set) var lastFireTime: String = "--"
+    /// 上一次实况拍摄的结果说明（显示在实况开关下方，帮我们诊断动态部分是否成功）
+    @Published private(set) var liveStatusText: String = ""
 
     // MARK: - 取景画面（后置摄像头实时预览）
     // 图层由界面上的 PreviewView 创建（苹果官方做法），引擎只负责把摄像头接上去
@@ -105,9 +107,10 @@ final class CameraEngine: NSObject, ObservableObject {
     private var nodThreshold: Double = 0.20
     private var mouthThreshold: Double = 0.055
 
-    // 实况图：等待动态视频落盘
+    // 实况图：照片与动态视频两部分都到了才算完成（苹果不保证回调先后顺序）
     private var awaitingLiveMovie = false
     private var livePendingPhotoData: Data?
+    private var livePendingMovieURL: URL?
 
     override init() {
         super.init()
@@ -371,14 +374,18 @@ final class CameraEngine: NSObject, ObservableObject {
                 while !s.isRunning && tries < 40 { usleep(100_000); tries += 1 }
 
                 if s.isRunning, let out = self.livePhotoOutput, out.isLivePhotoCaptureEnabled {
-                    // 3) 拍实况
+                    // 3) 等 0.4 秒让画质/对焦稳定，再拍实况
+                    usleep(400_000)
                     let settings = AVCapturePhotoSettings()
                     settings.photoQualityPrioritization = out.maxPhotoQualityPrioritization
                     let url = FileManager.default.temporaryDirectory
                         .appendingPathComponent("nodshot-live-\(UUID().uuidString).mov")
                     self.awaitingLiveMovie = true
                     self.livePendingPhotoData = nil
+                    self.livePendingMovieURL = nil
                     settings.livePhotoMovieFileURL = url
+                    self.setHint("实况拍摄中…")
+                    self.setLiveStatus("实况拍摄中…（照片+动态视频）")
                     out.capturePhoto(with: settings, delegate: self)
 
                     // 保底：6 秒后实况还没完成就存静帧并切回
@@ -387,12 +394,16 @@ final class CameraEngine: NSObject, ObservableObject {
                         if let d = self.livePendingPhotoData { self.save(data: d) }
                         self.awaitingLiveMovie = false
                         self.livePendingPhotoData = nil
+                        self.livePendingMovieURL = nil
                         self.setHint("实况处理超时，已存普通照片")
+                        self.setLiveStatus("上次实况：处理超时，只存了普通照片（长按不会动）")
                         self.restoreMultiCam()
                     }
                 } else {
                     // 单摄也不给实况（极小概率）：直接拍普通照片
                     self.setHint("此设备不支持实况，拍普通照片")
+                    self.setLiveStatus("上次实况：单摄也不支持实况（设备限制），存了普通照片")
+                    usleep(400_000)
                     if let out = self.livePhotoOutput {
                         let settings = AVCapturePhotoSettings()
                         settings.photoQualityPrioritization = out.maxPhotoQualityPrioritization
@@ -451,8 +462,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.livePhotoOutput = nil     // 用完即弃，下次实况再新建
                 self.liveCaptureBusy = false
                 self.baselineY = nil        // 相机换了，重新标定基线
-                self.nodArmed = true
-                self.mouthArmed = true
+                self.nodArmed = false       // ⚠️ 必须先复位（抬头/闭嘴）才允许下一次触发，
+                self.mouthArmed = false     //    否则嘴还张着就会立刻连拍（已踩坑：一次张嘴出3张）
+                self.lastFire = CFAbsoluteTimeGetCurrent()   // 冷却时间重新起算
                 self.start()
             }
         }
@@ -460,6 +472,10 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private func setHint(_ text: String) {
         DispatchQueue.main.async { if self.hint != text { self.hint = text } }
+    }
+
+    private func setLiveStatus(_ text: String) {
+        DispatchQueue.main.async { if self.liveStatusText != text { self.liveStatusText = text } }
     }
 
     private func qualityName(_ q: AVCapturePhotoOutput.QualityPrioritization) -> String {
@@ -585,6 +601,7 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
         guard error == nil, let data = photo.fileDataRepresentation() else {
             awaitingLiveMovie = false
             setHint("拍照失败：\(error?.localizedDescription ?? "未知错误")")
+            if liveCaptureBusy { restoreMultiCam() }   // 实况流程中静帧都失败，直接切回
             return
         }
         let image = UIImage(data: data)
@@ -596,14 +613,27 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
         }
 
         if awaitingLiveMovie {
-            // 等动态部分落盘后一起存成实况照片
+            // 照片部分到了；视频部分到了就立即组装实况，没到就等它
             livePendingPhotoData = data
+            tryFinishLive()
         } else {
             save(data: data)
         }
     }
 
-    // 实况的动态视频处理完成
+    /// 照片 + 视频两部分都到齐 → 组装成实况照片存入相册
+    private func tryFinishLive() {
+        guard let data = livePendingPhotoData, let url = livePendingMovieURL else { return }
+        awaitingLiveMovie = false
+        saveLive(photoData: data, movieURL: url)
+        livePendingPhotoData = nil
+        livePendingMovieURL = nil
+        setHint("已存实况照片，长按会动 ✅")
+        setLiveStatus("上次实况：成功，相册里长按照片会动")
+        if liveCaptureBusy { restoreMultiCam() }        // 单摄实况流程：切回双摄
+    }
+
+    // 实况的动态视频处理完成（可能比照片回调先到，也可能后到）
     func photoOutput(_ output: AVCapturePhotoOutput,
                      didFinishProcessingLivePhotoToMovieFileAt movieFileURL: URL,
                      duration: CMTime,
@@ -611,18 +641,23 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
                      resolvedSettings: AVCaptureResolvedPhotoSettings,
                      error: Error?) {
         guard awaitingLiveMovie else { return }
-        awaitingLiveMovie = false
-        let photoData = livePendingPhotoData
-        livePendingPhotoData = nil
 
-        guard error == nil, let data = photoData else {
-            if let data = photoData { save(data: data) }   // 至少保住静帧
-            setHint("实况保存失败：\(error?.localizedDescription ?? "未知错误")")
-            if liveCaptureBusy { restoreMultiCam() }        // 单摄实况流程：切回双摄
+        if let error = error {
+            // 动态视频确实失败了：保住静帧，报出具体原因
+            awaitingLiveMovie = false
+            let data = livePendingPhotoData
+            livePendingPhotoData = nil
+            livePendingMovieURL = nil
+            if let data = data { save(data: data) }
+            setHint("实况保存失败：\(error.localizedDescription)")
+            setLiveStatus("上次实况：动态视频失败（\(error.localizedDescription)），只存了普通照片")
+            if liveCaptureBusy { restoreMultiCam() }
             return
         }
-        saveLive(photoData: data, movieURL: movieFileURL)
-        if liveCaptureBusy { restoreMultiCam() }            // 单摄实况流程：切回双摄
+
+        // 视频部分到了；照片部分到了就立即组装实况，没到就等它
+        livePendingMovieURL = movieFileURL
+        tryFinishLive()
     }
 
     private func saveLive(photoData: Data, movieURL: URL) {

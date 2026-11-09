@@ -260,6 +260,12 @@ struct ContentView: View {
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if !engine.liveStatusText.isEmpty {
+                    Text(engine.liveStatusText)
+                        .font(.caption2)
+                        .foregroundStyle(engine.liveStatusText.contains("成功") ? Color.green : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Toggle("竖屏挂法（多数情况打开）", isOn: $engine.upright)
             Toggle("显示调试数值", isOn: $engine.showDebug)
