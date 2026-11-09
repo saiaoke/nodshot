@@ -252,6 +252,14 @@ struct ContentView: View {
 
             Toggle("测试模式（只震动不拍照）", isOn: $engine.testMode)
             Toggle("显示取景画面（挂好机位后可关掉省电）", isOn: $engine.showPreview)
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("拍实况图（Live Photo，带 3 秒动态）", isOn: $engine.livePhoto)
+                if engine.running && !engine.livePhotoSupported {
+                    Text("当前双摄模式下系统不允许实况，会拍普通照片（苹果的资源限制，不是 App 的问题）")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+            }
             Toggle("竖屏挂法（多数情况打开）", isOn: $engine.upright)
             Toggle("显示调试数值", isOn: $engine.showDebug)
         }

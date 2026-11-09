@@ -33,6 +33,17 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var showDebug: Bool = false
     @Published var showPreview: Bool = true        // 显示后置摄像头取景画面（挂脖后可以关掉省电降温）
 
+    // MARK: - 实况图（Live Photo）
+    /// 用户是否想拍实况图。切换后需要重建 session 才生效
+    @Published var livePhoto: Bool = false {
+        didSet {
+            guard oldValue != livePhoto, running else { return }
+            rebuildSession()
+        }
+    }
+    /// 当前配置（双摄/单摄）下系统是否允许实况 —— 运行时查询
+    @Published private(set) var livePhotoSupported = false
+
     // MARK: - 运行状态（UI 只读）
     @Published private(set) var running = false
     @Published private(set) var faceVisible = false
@@ -68,8 +79,9 @@ final class CameraEngine: NSObject, ObservableObject {
             let c = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             if s.canAddConnection(c) {
                 s.addConnection(c)
-                c.videoRotationAngle = 90
-                c.isVideoMirrored = previewMirrored
+                // ⚠️ 必须先确认支持再设置，否则 iOS 直接抛异常（已踩坑）
+                if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
+                if c.isVideoMirroringSupported { c.isVideoMirrored = previewMirrored }
             }
         }
         if needsConfig { s.commitConfiguration() }
@@ -93,6 +105,10 @@ final class CameraEngine: NSObject, ObservableObject {
 
     private var nodThreshold: Double = 0.20
     private var mouthThreshold: Double = 0.055
+
+    // 实况图：等待动态视频落盘
+    private var awaitingLiveMovie = false
+    private var livePendingPhotoData: Data?
 
     override init() {
         super.init()
@@ -142,6 +158,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.hint = ok ? (self.dualCamera ? "已启动，点头即可拍照" : "已启动（单摄模式，只能试触发不能存图）")
                                  : "启动失败，可能被其他 App 占用"
                 self.debugText = String(format: "hardwareCost %.2f", Double(cost))
+                if ok && self.livePhoto && !self.livePhotoSupported {
+                    self.hint = "已启动（此配置不支持实况，拍普通照片）"
+                }
             }
         }
         requestPhotoPermission()
@@ -162,8 +181,22 @@ final class CameraEngine: NSObject, ObservableObject {
         }
     }
 
-    func recalibrate() {
-        analysisQueue.async {
+    /// 切换实况开关后需要重建 session（实况必须在 startRunning 之前配置）
+    private func rebuildSession() {
+        guard let old = session else { return }
+        running = false
+        faceVisible = false
+        hint = "正在重启相机…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            if old.isRunning { old.stopRunning() }
+            DispatchQueue.main.async {
+                self.session = nil
+                self.start()
+            }
+        }
+    }
+
+    func recalibrate() {        analysisQueue.async {
             self.baselineY = nil
             self.smoothDrop = 0
             self.nodArmed = true
@@ -219,8 +252,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 let c = AVCaptureConnection(inputPorts: [port], output: photoOutput)
                 if s.canAddConnection(c) {
                     s.addConnection(c)
-                    c.videoRotationAngle = 90     // 手机竖着挂在胸前 → 照片正着
-                    c.isVideoMirrored = false
+                    // 同样先检查支持性，防止同类异常
+                    if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
+                    if c.isVideoMirroringSupported { c.isVideoMirrored = false }
                     dual = true
                     previewPort = port              // 取景画面用后置
                 }
@@ -239,6 +273,14 @@ final class CameraEngine: NSObject, ObservableObject {
         dualCamera = dual
         // 取景画面：界面上的图层如果已经就绪，这里把摄像头接上
         configurePreviewIfPossible()
+
+        // 实况必须在 startRunning 之前配置好，所以放在配置块里
+        if dual && photoOutput.isLivePhotoCaptureSupported {
+            photoOutput.isLivePhotoCaptureEnabled = livePhoto
+            livePhotoSupported = true
+        } else {
+            livePhotoSupported = false
+        }
 
         s.commitConfiguration()
     }
@@ -269,6 +311,17 @@ final class CameraEngine: NSObject, ObservableObject {
         }
         let settings = AVCapturePhotoSettings()
         settings.photoQualityPrioritization = .quality
+
+        // 实况图：照片 + 约 3 秒动态
+        let useLive = livePhoto && livePhotoSupported && photoOutput.isLivePhotoCaptureEnabled
+        awaitingLiveMovie = useLive
+        livePendingPhotoData = nil
+        if useLive {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nodshot-live-\(UUID().uuidString).mov")
+            settings.livePhotoMovieFileURL = url
+        }
+
         photoOutput.capturePhoto(with: settings, delegate: self)
     }
 
@@ -388,6 +441,7 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
                      didFinishProcessingPhoto photo: AVCapturePhoto,
                      error: Error?) {
         guard error == nil, let data = photo.fileDataRepresentation() else {
+            awaitingLiveMovie = false
             setHint("拍照失败：\(error?.localizedDescription ?? "未知错误")")
             return
         }
@@ -395,9 +449,54 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
         DispatchQueue.main.async {
             self.lastShot = image
             self.shotCount += 1
-            self.hint = "已拍第 \(self.shotCount) 张"
+            self.hint = self.awaitingLiveMovie ? "已拍第 \(self.shotCount) 张（实况，处理中）"
+                                               : "已拍第 \(self.shotCount) 张"
         }
-        save(data: data)
+
+        if awaitingLiveMovie {
+            // 等动态部分落盘后一起存成实况照片
+            livePendingPhotoData = data
+        } else {
+            save(data: data)
+        }
+    }
+
+    // 实况的动态视频处理完成
+    func photoOutput(_ output: AVCapturePhotoOutput,
+                     didFinishProcessingLivePhotoToMovieFileAt movieFileURL: URL,
+                     duration: CMTime,
+                     photoDisplayTime: CMTime,
+                     resolvedSettings: AVCaptureResolvedPhotoSettings,
+                     error: Error?) {
+        guard awaitingLiveMovie else { return }
+        awaitingLiveMovie = false
+        let photoData = livePendingPhotoData
+        livePendingPhotoData = nil
+
+        guard error == nil, let data = photoData else {
+            if let data = photoData { save(data: data) }   // 至少保住静帧
+            setHint("实况保存失败：\(error?.localizedDescription ?? "未知错误")")
+            return
+        }
+        saveLive(photoData: data, movieURL: movieFileURL)
+    }
+
+    private func saveLive(photoData: Data, movieURL: URL) {
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                self.setHint("没有相册写入权限：设置 > NodShot > 照片")
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                let req = PHAssetCreationRequest.forAsset()
+                req.addResource(with: .photo, data: photoData, options: nil)
+                let opts = PHAssetResourceCreationOptions()
+                opts.shouldMoveFile = true
+                req.addResource(with: .pairedVideo, fileURL: movieURL, options: opts)
+            } completionHandler: { ok, err in
+                if !ok { self.setHint("存实况失败：\(err?.localizedDescription ?? "")") }
+            }
+        }
     }
 
     private func save(data: Data) {
