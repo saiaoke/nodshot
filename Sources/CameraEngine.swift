@@ -427,6 +427,10 @@ final class CameraEngine: NSObject, ObservableObject {
             throw EngineError(msg: "找不到后置摄像头")
         }
         let s = AVCaptureSession()
+        // ⚠️ 必须用 .photo 预设：新建 session 默认是 .high（视频预设），
+        //    照片输出在视频预设下 isLivePhotoCaptureSupported 恒为 false（已踩坑）
+        //    .photo 预设 = 支持实况 + 照片全分辨率 12MP
+        s.sessionPreset = .photo
         s.beginConfiguration()
         let input = try AVCaptureDeviceInput(device: rear)
         guard s.canAddInput(input) else {
