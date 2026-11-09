@@ -141,27 +141,41 @@ final class CameraEngine: NSObject, ObservableObject {
             return
         }
 
-        if session == nil {
-            do { try buildSession() }
-            catch {
-                hint = "相机初始化失败：\(error.localizedDescription)"
-                return
-            }
-        }
-        guard let s = session, !s.isRunning else { return }
-
         DispatchQueue.global(qos: .userInitiated).async {
-            // ⚠️ 刚停掉的旧会话释放摄像头有延迟：立刻 startRunning 会失败（已踩坑）
-            //    失败就等 1 秒重试，最多 3 次
+            // ⚠️ 两个坑都在这里处理：
+            //    ① 刚停掉的旧会话释放摄像头有延迟：立刻 startRunning 会失败
+            //    ② 在同一个坏 session 上反复重试永远起不来——必须整个拆掉重建
             var ok = false
             for _ in 0..<3 {
+                // 没有会话（比如刚被拆掉）→ 重建
+                DispatchQueue.main.sync {
+                    if self.session == nil {
+                        do { try self.buildSession() }
+                        catch { self.hint = "相机初始化失败：\(error.localizedDescription)" }
+                    }
+                }
+                guard let s = self.session else { break }
                 s.startRunning()
                 ok = s.isRunning
                 if ok { break }
-                usleep(1_000_000)
+
+                // 启动失败 → 彻底拆掉这个 session 并置空（ARC 释放后才归还摄像头），
+                // 等待期间摄像头被系统收回，下一轮重建就是干净的
+                DispatchQueue.main.sync {
+                    if let cur = self.session {
+                        if cur.isRunning { cur.stopRunning() }
+                        cur.beginConfiguration()
+                        for o in cur.outputs { cur.removeOutput(o) }
+                        for i in cur.inputs { cur.removeInput(i) }
+                        cur.commitConfiguration()
+                    }
+                    self.session = nil
+                    self.previewPort = nil
+                }
+                usleep(1_500_000)   // 等系统真正释放摄像头
             }
             var cost: Float = 0
-            if let mc = s as? AVCaptureMultiCamSession { cost = mc.hardwareCost }
+            if let mc = self.session as? AVCaptureMultiCamSession { cost = mc.hardwareCost }
             DispatchQueue.main.async {
                 self.running = ok
                 if !ok {
@@ -472,17 +486,23 @@ final class CameraEngine: NSObject, ObservableObject {
     /// 实况拍完后切回双摄（点头检测恢复）
     private func restoreMultiCam() {
         DispatchQueue.global(qos: .userInitiated).async {
-            if let cur = self.session {
+            // 先断引用再停：session 置空后 ARC 才会在等待期间真正释放摄像头（已踩坑：
+            // 旧写法"先等1秒再置空"，等待期间对象还被攥着，摄像头根本没归还）
+            var cur: AVCaptureSession?
+            DispatchQueue.main.sync {
+                cur = self.session
+                self.session = nil
+                self.previewPort = nil
+            }
+            if let cur = cur {
                 if cur.isRunning { cur.stopRunning() }
                 cur.beginConfiguration()
                 for o in cur.outputs { cur.removeOutput(o) }
                 for i in cur.inputs { cur.removeInput(i) }
                 cur.commitConfiguration()
             }
-            // ⚠️ 刚停的会话释放摄像头有延迟（约1秒），立刻重建会启动失败（已踩坑）
-            usleep(1_000_000)   // 等设备释放
+            usleep(1_500_000)   // 等系统真正释放摄像头（此时 session 已无引用，释放是真实发生的）
             DispatchQueue.main.async {
-                self.session = nil
                 self.livePhotoOutput = nil     // 用完即弃，下次实况再新建
                 self.liveCaptureBusy = false
                 self.baselineY = nil        // 相机换了，重新标定基线
