@@ -88,6 +88,17 @@ final class CameraEngine: NSObject, ObservableObject {
         if needsConfig { s.commitConfiguration() }
     }
 
+    /// 把预览图层从指定 session 上解绑。
+    /// ⚠️ 预览图层会强引用它的 session——不解绑，旧 session 永远释放不掉，
+    /// 摄像头也就归还不了，重建的新会话 startRunning 必失败（v8 修复）
+    private func detachPreviewFromSession(_ s: AVCaptureSession) {
+        DispatchQueue.main.sync {
+            if let layer = self.previewLayer, layer.session === s {
+                layer.setSessionWithNoConnection(nil)
+            }
+        }
+    }
+
     // MARK: - 私有
     private var session: AVCaptureSession?
     private let photoOutput = AVCapturePhotoOutput()
@@ -125,18 +136,29 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     // MARK: - 启动 / 停止
+    /// 一次启动流程正在进行中（防止看门狗/手动点按钮并发打架）
+    private var starting = false
+    /// 用户想要相机处于运行状态（点启动=true，点停止=false）。
+    /// 看门狗只在这个标记为 true 时才自动重试恢复
+    private var wantRunning = false
+
     func start() {
+        wantRunning = true
+        guard !starting else { return }
+        starting = true
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             break
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { ok in
                 DispatchQueue.main.async {
+                    self.starting = false
                     if ok { self.start() } else { self.hint = "没有相机权限，请到 设置 > NodShot 打开" }
                 }
             }
             return
         default:
+            starting = false
             hint = "相机权限被关闭了：设置 > NodShot > 相机"
             return
         }
@@ -146,7 +168,10 @@ final class CameraEngine: NSObject, ObservableObject {
             //    ① 刚停掉的旧会话释放摄像头有延迟：立刻 startRunning 会失败
             //    ② 在同一个坏 session 上反复重试永远起不来——必须整个拆掉重建
             var ok = false
-            for _ in 0..<3 {
+            for attempt in 1...3 {
+                DispatchQueue.main.async {
+                    self.hint = attempt == 1 ? "正在启动相机…" : "正在启动相机（第 \(attempt) 次尝试）…"
+                }
                 // 没有会话（比如刚被拆掉）→ 重建
                 DispatchQueue.main.sync {
                     if self.session == nil {
@@ -163,6 +188,9 @@ final class CameraEngine: NSObject, ObservableObject {
                 // 等待期间摄像头被系统收回，下一轮重建就是干净的
                 DispatchQueue.main.sync {
                     if let cur = self.session {
+                        if let layer = self.previewLayer, layer.session === cur {
+                            layer.setSessionWithNoConnection(nil)   // ⚠️ 解绑预览（v8）
+                        }
                         if cur.isRunning { cur.stopRunning() }
                         cur.beginConfiguration()
                         for o in cur.outputs { cur.removeOutput(o) }
@@ -177,7 +205,8 @@ final class CameraEngine: NSObject, ObservableObject {
             var cost: Float = 0
             if let mc = self.session as? AVCaptureMultiCamSession { cost = mc.hardwareCost }
             DispatchQueue.main.async {
-                self.running = ok
+                self.starting = false
+                self.running = ok && self.wantRunning   // 用户中途点了「停止」就不算启动成功
                 if !ok {
                     self.faceVisible = false
                     self.nodRatio = 0
@@ -199,6 +228,8 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     func stop() {
+        wantRunning = false          // 看门狗看到这个就不会再自动拉起相机
+        starting = false
         guard let s = session else { return }
         DispatchQueue.global(qos: .userInitiated).async {
             if s.isRunning { s.stopRunning() }
@@ -219,7 +250,13 @@ final class CameraEngine: NSObject, ObservableObject {
         faceVisible = false
         hint = "正在重启相机…"
         DispatchQueue.global(qos: .userInitiated).async {
+            self.detachPreviewFromSession(old)   // ⚠️ 解绑预览（v8）
             if old.isRunning { old.stopRunning() }
+            old.beginConfiguration()
+            for o in old.outputs { old.removeOutput(o) }
+            for i in old.inputs { old.removeInput(i) }
+            old.commitConfiguration()
+            usleep(1_500_000)   // 等摄像头真正释放（v8）
             DispatchQueue.main.async {
                 self.session = nil
                 self.start()
@@ -245,6 +282,10 @@ final class CameraEngine: NSObject, ObservableObject {
         let multiOK = AVCaptureMultiCamSession.isMultiCamSupported
         let s: AVCaptureSession = multiOK ? AVCaptureMultiCamSession() : AVCaptureSession()
         s.beginConfiguration()
+        // ⚠️ v8：给多摄会话也设 .photo 预设（v5 教训：默认预设下照片输出不支持实况）。
+        //    如果设上后双摄直接支持实况 → 点头后无需切单摄、无需重启相机，
+        //    "拍完启动不了"的问题从根上消失。canSetSessionPreset 先问（不支持就设会抛异常）
+        if s.canSetSessionPreset(.photo) { s.sessionPreset = .photo }
 
         guard let front = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
             s.commitConfiguration()
@@ -386,6 +427,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async {
             // 1) 停双摄并解除输出/输入关联（输入也要解除，释放后置摄像头占用）
+            self.detachPreviewFromSession(old)   // ⚠️ 先解绑预览，旧 session 才能真正释放
             if old.isRunning { old.stopRunning() }
             old.beginConfiguration()
             for o in old.outputs { old.removeOutput(o) }
@@ -495,6 +537,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.previewPort = nil
             }
             if let cur = cur {
+                self.detachPreviewFromSession(cur)   // ⚠️ 预览图层攥着 session 不放 → 摄像头归还不了（v8 修复）
                 if cur.isRunning { cur.stopRunning() }
                 cur.beginConfiguration()
                 for o in cur.outputs { cur.removeOutput(o) }
@@ -509,9 +552,41 @@ final class CameraEngine: NSObject, ObservableObject {
                 self.nodArmed = false       // ⚠️ 必须先复位（抬头/闭嘴）才允许下一次触发，
                 self.mouthArmed = false     //    否则嘴还张着就会立刻连拍（已踩坑：一次张嘴出3张）
                 self.lastFire = CFAbsoluteTimeGetCurrent()   // 冷却时间重新起算
-                self.start()
+                self.hint = "实况已保存，正在恢复相机…"
+                self.restartMultiCamWithRetries()
             }
         }
+    }
+
+    /// v9 看门狗：实况拍完后自动恢复双摄，不需要手动点「启动」。
+    /// 相机释放有多慢都无所谓——后台每 3 秒查一次，没起来就再试，
+    /// 最多试 12 轮（约 40 秒），起来为止。中途点「停止」会立刻放弃。
+    private func restartMultiCamWithRetries() {
+        var attempts = 0
+        func tick() {
+            guard self.wantRunning, !self.running else { return }
+            if !self.starting {
+                attempts += 1
+                self.start()   // start() 内部自带 3 轮「拆掉重建」重试
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self else { return }
+                if self.running {
+                    self.hint = attempts > 1
+                        ? "相机已自动恢复（第 \(attempts) 次尝试成功），继续拍"
+                        : "已恢复，点头即可继续拍"
+                    return
+                }
+                guard self.wantRunning else { return }   // 用户主动停了，别再拉起
+                if attempts < 12 {
+                    self.hint = "正在自动恢复相机…（已试 \(attempts) 次，无需操作）"
+                    tick()
+                } else {
+                    self.hint = "相机自动恢复失败：请手动点一次「启动」"
+                }
+            }
+        }
+        tick()
     }
 
     private func setHint(_ text: String) {
