@@ -31,6 +31,7 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published var testMode: Bool = false          // 只震不动，用来调灵敏度
     @Published var upright: Bool = true            // 竖着挂（竖屏方向）
     @Published var showDebug: Bool = false
+    @Published var showPreview: Bool = true        // 显示后置摄像头取景画面（挂脖后可以关掉省电降温）
 
     // MARK: - 运行状态（UI 只读）
     @Published private(set) var running = false
@@ -43,6 +44,9 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published private(set) var dualCamera = false
     @Published private(set) var debugText: String = ""
     @Published private(set) var lastFireTime: String = "--"
+
+    // MARK: - 取景画面（后置摄像头实时预览）
+    let previewLayer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: AVCaptureSession())
 
     // MARK: - 私有
     private var session: AVCaptureSession?
@@ -161,6 +165,10 @@ final class CameraEngine: NSObject, ObservableObject {
         videoOutput.setSampleBufferDelegate(self, queue: analysisQueue)
 
         var dual = false
+        // 预览用哪一个摄像头的画面：有后摄就显示后摄（产品那边），否则显示前摄
+        var previewPort: AVCaptureInput.Port?
+        var previewMirrored = false
+
         if multiOK, let rear = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
            s.canAddInput(frontInput) {
             let rearInput = try AVCaptureDeviceInput(device: rear)
@@ -187,12 +195,29 @@ final class CameraEngine: NSObject, ObservableObject {
                     c.videoRotationAngle = 90     // 手机竖着挂在胸前 → 照片正着
                     c.isVideoMirrored = false
                     dual = true
+                    previewPort = port              // 取景画面用后置
                 }
             }
         } else if s.canAddInput(frontInput) {
             // 兜底：只有前置，只能做触发测试
             s.addInput(frontInput)
             if s.canAddOutput(videoOutput) { s.addOutput(videoOutput) }
+            previewPort = frontInput.ports(for: .video,
+                                           sourceDeviceType: .builtInWideAngleCamera,
+                                           sourceDevicePosition: .front).first
+            previewMirrored = true
+        }
+
+        // 取景画面：多摄/单摄都必须手动建立预览连接
+        previewLayer.videoGravity = .resizeAspectFill
+        previewLayer.setSessionWithNoConnection(s)
+        if let port = previewPort {
+            let c = AVCaptureConnection(inputPort: port, videoPreviewLayer: previewLayer)
+            if s.canAddConnection(c) {
+                s.addConnection(c)
+                c.videoRotationAngle = 90
+                c.isVideoMirrored = previewMirrored
+            }
         }
 
         s.commitConfiguration()

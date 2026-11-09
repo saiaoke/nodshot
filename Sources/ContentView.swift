@@ -7,6 +7,8 @@
 //
 
 import SwiftUI
+import AVFoundation
+import UIKit
 
 @main
 struct NodShotApp: App {
@@ -18,6 +20,39 @@ struct NodShotApp: App {
     }
 }
 
+// MARK: - 取景画面（后置摄像头的实时预览）
+final class PreviewHostView: UIView {
+    private let previewLayer: AVCaptureVideoPreviewLayer
+
+    init(previewLayer: AVCaptureVideoPreviewLayer) {
+        self.previewLayer = previewLayer
+        super.init(frame: .zero)
+        backgroundColor = .black
+        clipsToBounds = true
+        layer.addSublayer(previewLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        previewLayer.frame = bounds
+        CATransaction.commit()
+    }
+}
+
+struct CameraPreviewView: UIViewRepresentable {
+    let previewLayer: AVCaptureVideoPreviewLayer
+
+    func makeUIView(context: Context) -> PreviewHostView {
+        PreviewHostView(previewLayer: previewLayer)
+    }
+
+    func updateUIView(_ uiView: PreviewHostView, context: Context) {}
+}
+
 struct ContentView: View {
     @StateObject private var engine = CameraEngine()
 
@@ -25,6 +60,7 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    if engine.showPreview { previewCard }
                     statusCard
                     actionRow
                     meterCard
@@ -38,6 +74,45 @@ struct ContentView: View {
             .navigationTitle("点头快门")
             .navigationBarTitleDisplayMode(.inline)
             .onDisappear { engine.stop() }
+        }
+    }
+
+    // MARK: - 取景卡
+    private var previewCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ZStack {
+                CameraPreviewView(previewLayer: engine.previewLayer)
+                    .aspectRatio(3.0 / 4.0, contentMode: .fit)
+                    .background(Color.black)
+                    .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                if !engine.running {
+                    VStack(spacing: 6) {
+                        Image(systemName: "camera.viewfinder")
+                            .font(.system(size: 34))
+                            .foregroundStyle(.white.opacity(0.5))
+                        Text("点「启动」后显示取景画面")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                } else if !engine.dualCamera {
+                    Text("当前为单摄模式，取景画面来自前置摄像头")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                        .padding(6)
+                        .background(Color.black.opacity(0.6))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+
+            Text("以上是后置摄像头看到的画面 —— 照片拍到的就是这个范围。产品要完整落在框里。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -180,6 +255,7 @@ struct ContentView: View {
             }
 
             Toggle("测试模式（只震动不拍照）", isOn: $engine.testMode)
+            Toggle("显示取景画面（挂好机位后可关掉省电）", isOn: $engine.showPreview)
             Toggle("竖屏挂法（多数情况打开）", isOn: $engine.upright)
             Toggle("显示调试数值", isOn: $engine.showDebug)
         }
