@@ -278,15 +278,16 @@ final class CameraEngine: NSObject, ObservableObject {
         // 取景画面：界面上的图层如果已经就绪，这里把摄像头接上
         configurePreviewIfPossible()
 
-        // 实况必须在 startRunning 之前配置好，所以放在配置块里
+        s.commitConfiguration()
+
+        // ⚠️ 支持性必须在 commitConfiguration 之后查询（配置块内恒为 false，已踩坑）
+        //    注意：双摄多摄会话大概率仍然真不支持实况，这里修正后能查到真实值
         if dual && photoOutput.isLivePhotoCaptureSupported {
             photoOutput.isLivePhotoCaptureEnabled = livePhoto
             livePhotoSupported = true
         } else {
             livePhotoSupported = false
         }
-
-        s.commitConfiguration()
     }
 
     // MARK: - 权限
@@ -441,9 +442,14 @@ final class CameraEngine: NSObject, ObservableObject {
             throw EngineError(msg: "无法添加照片输出")
         }
         s.addOutput(out)
-        out.isLivePhotoCaptureEnabled = out.isLivePhotoCaptureSupported
-        self.livePhotoOutput = out
         s.commitConfiguration()
+        // ⚠️ isLivePhotoCaptureSupported 必须在 commitConfiguration 之后查询——
+        //    配置块内查询恒为 false（已踩坑：被误判为"设备不支持"）。
+        //    苹果官方 AVCam 示例也是提交配置后再开启实况。
+        if out.isLivePhotoCaptureSupported {
+            out.isLivePhotoCaptureEnabled = true
+        }
+        self.livePhotoOutput = out
         return s
     }
 
