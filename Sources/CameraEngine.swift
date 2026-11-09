@@ -293,6 +293,7 @@ final class CameraEngine: NSObject, ObservableObject {
 
     // MARK: - 触发
     private func fire() {
+        guard !liveCaptureBusy else { return }   // 单摄拍实况期间不接受新触发
         lastFire = CFAbsoluteTimeGetCurrent()
         DispatchQueue.main.async {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -310,6 +311,13 @@ final class CameraEngine: NSObject, ObservableObject {
             DispatchQueue.main.async { self.hint = "单摄/测试模式，未保存照片" }
             return
         }
+
+        // 想拍实况 + 双摄模式不允许 → 自动切到后置单摄拍真·实况（约1~2秒延迟）
+        if livePhoto && !livePhotoSupported {
+            captureLiveViaSingleCam()
+            return
+        }
+
         let settings = AVCapturePhotoSettings()
         // 自动用当前配置允许的最高画质：系统允许 .quality 就用 .quality，
         // 不允许（多摄模式限制）就自动落到系统上限。这是苹果官方示例的标准写法。
@@ -326,6 +334,115 @@ final class CameraEngine: NSObject, ObservableObject {
         }
 
         photoOutput.capturePhoto(with: settings, delegate: self)
+    }
+
+    // MARK: - 切换单摄拍真·实况（双摄模式下系统不允许实况，这是绕过办法）
+    /// 切换期间为 true，冻结一切触发
+    private var liveCaptureBusy = false
+
+    /// 点头触发后：停双摄 → 建后置单摄 session（开实况）→ 拍 → 存 → 切回双摄
+    private func captureLiveViaSingleCam() {
+        guard !liveCaptureBusy, let old = session else { return }
+        liveCaptureBusy = true
+        DispatchQueue.main.async {
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+        setHint("正在切换单摄拍实况（约1~2秒）…")
+        AudioServicesPlaySystemSound(1108)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            // 1) 停双摄并解除输出关联
+            if old.isRunning { old.stopRunning() }
+            old.beginConfiguration()
+            for o in old.outputs { old.removeOutput(o) }
+            old.commitConfiguration()
+
+            // 2) 建后置单摄 session，开实况
+            do {
+                let s = try self.buildLiveSession()
+                self.session = s
+                s.startRunning()
+                var tries = 0
+                while !s.isRunning && tries < 40 { usleep(100_000); tries += 1 }
+
+                if s.isRunning, self.photoOutput.isLivePhotoCaptureEnabled {
+                    // 3) 拍实况
+                    let settings = AVCapturePhotoSettings()
+                    settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
+                    let url = FileManager.default.temporaryDirectory
+                        .appendingPathComponent("nodshot-live-\(UUID().uuidString).mov")
+                    self.awaitingLiveMovie = true
+                    self.livePendingPhotoData = nil
+                    settings.livePhotoMovieFileURL = url
+                    self.photoOutput.capturePhoto(with: settings, delegate: self)
+
+                    // 保底：6 秒后实况还没完成就存静帧并切回
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+                        guard let self, self.liveCaptureBusy, self.awaitingLiveMovie else { return }
+                        if let d = self.livePendingPhotoData { self.save(data: d) }
+                        self.awaitingLiveMovie = false
+                        self.livePendingPhotoData = nil
+                        self.setHint("实况处理超时，已存普通照片")
+                        self.restoreMultiCam()
+                    }
+                } else {
+                    // 单摄也不给实况（极小概率）：直接拍普通照片
+                    self.setHint("此设备不支持实况，拍普通照片")
+                    let settings = AVCapturePhotoSettings()
+                    settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
+                    self.photoOutput.capturePhoto(with: settings, delegate: self)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                        self?.restoreMultiCam()
+                    }
+                }
+            } catch {
+                self.setHint("实况初始化失败：\(error.localizedDescription)")
+                self.restoreMultiCam()
+            }
+        }
+    }
+
+    /// 后置单摄 + 实况照片输出的临时 session
+    private func buildLiveSession() throws -> AVCaptureSession {
+        guard let rear = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+            throw EngineError(msg: "找不到后置摄像头")
+        }
+        let s = AVCaptureSession()
+        s.beginConfiguration()
+        let input = try AVCaptureDeviceInput(device: rear)
+        guard s.canAddInput(input) else {
+            s.commitConfiguration()
+            throw EngineError(msg: "无法添加后置摄像头")
+        }
+        s.addInput(input)
+        guard s.canAddOutput(photoOutput) else {
+            s.commitConfiguration()
+            throw EngineError(msg: "无法添加照片输出")
+        }
+        s.addOutput(photoOutput)
+        photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
+        s.commitConfiguration()
+        return s
+    }
+
+    /// 实况拍完后切回双摄（点头检测恢复）
+    private func restoreMultiCam() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let cur = self.session {
+                if cur.isRunning { cur.stopRunning() }
+                cur.beginConfiguration()
+                for o in cur.outputs { cur.removeOutput(o) }
+                cur.commitConfiguration()
+            }
+            DispatchQueue.main.async {
+                self.session = nil
+                self.liveCaptureBusy = false
+                self.baselineY = nil        // 相机换了，重新标定基线
+                self.nodArmed = true
+                self.mouthArmed = true
+                self.start()
+            }
+        }
     }
 
     private func setHint(_ text: String) {
@@ -488,9 +605,11 @@ extension CameraEngine: AVCapturePhotoCaptureDelegate {
         guard error == nil, let data = photoData else {
             if let data = photoData { save(data: data) }   // 至少保住静帧
             setHint("实况保存失败：\(error?.localizedDescription ?? "未知错误")")
+            if liveCaptureBusy { restoreMultiCam() }        // 单摄实况流程：切回双摄
             return
         }
         saveLive(photoData: data, movieURL: movieFileURL)
+        if liveCaptureBusy { restoreMultiCam() }            // 单摄实况流程：切回双摄
     }
 
     private func saveLive(photoData: Data, movieURL: URL) {

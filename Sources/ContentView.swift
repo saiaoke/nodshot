@@ -255,9 +255,10 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Toggle("拍实况图（Live Photo，带 3 秒动态）", isOn: $engine.livePhoto)
                 if engine.running && !engine.livePhotoSupported {
-                    Text("当前双摄模式下系统不允许实况，会拍普通照片（苹果的资源限制，不是 App 的问题）")
+                    Text("双摄模式下系统不允许直接拍实况。开启后：点头 → App 自动切到后置单摄拍真·实况（约 1~2 秒延迟）→ 自动切回点头检测。产品是静物，延迟无影响。")
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Toggle("竖屏挂法（多数情况打开）", isOn: $engine.upright)
