@@ -339,6 +339,10 @@ final class CameraEngine: NSObject, ObservableObject {
     // MARK: - 切换单摄拍真·实况（双摄模式下系统不允许实况，这是绕过办法）
     /// 切换期间为 true，冻结一切触发
     private var liveCaptureBusy = false
+    /// 实况专用、每次新建的独立照片输出。
+    /// ⚠️ 苹果规定同一个 AVCaptureOutput 不能挂到两个 session——复用多摄的 photoOutput
+    /// 会在 startRunning 时内核断言崩溃（日志: attachToFigCaptureSession → SIGABRT，已踩坑）
+    private var livePhotoOutput: AVCapturePhotoOutput?
 
     /// 点头触发后：停双摄 → 建后置单摄 session（开实况）→ 拍 → 存 → 切回双摄
     private func captureLiveViaSingleCam() {
@@ -351,10 +355,11 @@ final class CameraEngine: NSObject, ObservableObject {
         AudioServicesPlaySystemSound(1108)
 
         DispatchQueue.global(qos: .userInitiated).async {
-            // 1) 停双摄并解除输出关联
+            // 1) 停双摄并解除输出/输入关联（输入也要解除，释放后置摄像头占用）
             if old.isRunning { old.stopRunning() }
             old.beginConfiguration()
             for o in old.outputs { old.removeOutput(o) }
+            for i in old.inputs { old.removeInput(i) }
             old.commitConfiguration()
 
             // 2) 建后置单摄 session，开实况
@@ -365,16 +370,16 @@ final class CameraEngine: NSObject, ObservableObject {
                 var tries = 0
                 while !s.isRunning && tries < 40 { usleep(100_000); tries += 1 }
 
-                if s.isRunning, self.photoOutput.isLivePhotoCaptureEnabled {
+                if s.isRunning, let out = self.livePhotoOutput, out.isLivePhotoCaptureEnabled {
                     // 3) 拍实况
                     let settings = AVCapturePhotoSettings()
-                    settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
+                    settings.photoQualityPrioritization = out.maxPhotoQualityPrioritization
                     let url = FileManager.default.temporaryDirectory
                         .appendingPathComponent("nodshot-live-\(UUID().uuidString).mov")
                     self.awaitingLiveMovie = true
                     self.livePendingPhotoData = nil
                     settings.livePhotoMovieFileURL = url
-                    self.photoOutput.capturePhoto(with: settings, delegate: self)
+                    out.capturePhoto(with: settings, delegate: self)
 
                     // 保底：6 秒后实况还没完成就存静帧并切回
                     DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
@@ -388,9 +393,11 @@ final class CameraEngine: NSObject, ObservableObject {
                 } else {
                     // 单摄也不给实况（极小概率）：直接拍普通照片
                     self.setHint("此设备不支持实况，拍普通照片")
-                    let settings = AVCapturePhotoSettings()
-                    settings.photoQualityPrioritization = self.photoOutput.maxPhotoQualityPrioritization
-                    self.photoOutput.capturePhoto(with: settings, delegate: self)
+                    if let out = self.livePhotoOutput {
+                        let settings = AVCapturePhotoSettings()
+                        settings.photoQualityPrioritization = out.maxPhotoQualityPrioritization
+                        out.capturePhoto(with: settings, delegate: self)
+                    }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                         self?.restoreMultiCam()
                     }
@@ -415,12 +422,16 @@ final class CameraEngine: NSObject, ObservableObject {
             throw EngineError(msg: "无法添加后置摄像头")
         }
         s.addInput(input)
-        guard s.canAddOutput(photoOutput) else {
+        // ⚠️ 每次新建独立的 PhotoOutput，绝不复用多摄 session 的那个——
+        // 同一个 output 挂两个 session 会在 startRunning 时内核断言崩溃（SIGABRT，已踩坑）
+        let out = AVCapturePhotoOutput()
+        guard s.canAddOutput(out) else {
             s.commitConfiguration()
             throw EngineError(msg: "无法添加照片输出")
         }
-        s.addOutput(photoOutput)
-        photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
+        s.addOutput(out)
+        out.isLivePhotoCaptureEnabled = out.isLivePhotoCaptureSupported
+        self.livePhotoOutput = out
         s.commitConfiguration()
         return s
     }
@@ -432,10 +443,12 @@ final class CameraEngine: NSObject, ObservableObject {
                 if cur.isRunning { cur.stopRunning() }
                 cur.beginConfiguration()
                 for o in cur.outputs { cur.removeOutput(o) }
+                for i in cur.inputs { cur.removeInput(i) }
                 cur.commitConfiguration()
             }
             DispatchQueue.main.async {
                 self.session = nil
+                self.livePhotoOutput = nil     // 用完即弃，下次实况再新建
                 self.liveCaptureBusy = false
                 self.baselineY = nil        // 相机换了，重新标定基线
                 self.nodArmed = true
