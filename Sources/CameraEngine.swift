@@ -79,9 +79,8 @@ final class CameraEngine: NSObject, ObservableObject {
             let c = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             if s.canAddConnection(c) {
                 s.addConnection(c)
-                // ⚠️ 必须先确认支持再设置，否则 iOS 直接抛异常（已踩坑）
-                if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
-                if c.isVideoMirroringSupported { c.isVideoMirrored = previewMirrored }
+                // ⚠️ 多摄模式下对预览连接设置镜像/旋转属性会直接抛异常（连"查询是否支持"都不行）
+                // 所以这里什么都不设：预览图层会自动跟随竖屏方向
             }
         }
         if needsConfig { s.commitConfiguration() }
@@ -252,9 +251,8 @@ final class CameraEngine: NSObject, ObservableObject {
                 let c = AVCaptureConnection(inputPorts: [port], output: photoOutput)
                 if s.canAddConnection(c) {
                     s.addConnection(c)
-                    // 同样先检查支持性，防止同类异常
-                    if c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }
-                    if c.isVideoMirroringSupported { c.isVideoMirrored = false }
+                    // 不设置旋转/镜像：多摄模式下这些属性的读写都可能抛异常
+                    // 照片方向如果不对，用软件旋转修正（安全，不碰系统 API）
                     dual = true
                     previewPort = port              // 取景画面用后置
                 }
