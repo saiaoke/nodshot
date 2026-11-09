@@ -151,14 +151,26 @@ final class CameraEngine: NSObject, ObservableObject {
         guard let s = session, !s.isRunning else { return }
 
         DispatchQueue.global(qos: .userInitiated).async {
-            s.startRunning()
-            let ok = s.isRunning
+            // ⚠️ 刚停掉的旧会话释放摄像头有延迟：立刻 startRunning 会失败（已踩坑）
+            //    失败就等 1 秒重试，最多 3 次
+            var ok = false
+            for _ in 0..<3 {
+                s.startRunning()
+                ok = s.isRunning
+                if ok { break }
+                usleep(1_000_000)
+            }
             var cost: Float = 0
             if let mc = s as? AVCaptureMultiCamSession { cost = mc.hardwareCost }
             DispatchQueue.main.async {
                 self.running = ok
+                if !ok {
+                    self.faceVisible = false
+                    self.nodRatio = 0
+                    self.mouthRatio = 0
+                }
                 self.hint = ok ? (self.dualCamera ? "已启动，点头即可拍照" : "已启动（单摄模式，只能试触发不能存图）")
-                                 : "启动失败，可能被其他 App 占用"
+                                 : "相机重启失败，请再点一次「启动」"
                 self.debugText = String(format: "hardwareCost %.2f · 画质上限 %@ · 实况支持 %@",
                                         Double(cost),
                                         self.qualityName(self.photoOutput.maxPhotoQualityPrioritization),
@@ -467,6 +479,8 @@ final class CameraEngine: NSObject, ObservableObject {
                 for i in cur.inputs { cur.removeInput(i) }
                 cur.commitConfiguration()
             }
+            // ⚠️ 刚停的会话释放摄像头有延迟（约1秒），立刻重建会启动失败（已踩坑）
+            usleep(1_000_000)   // 等设备释放
             DispatchQueue.main.async {
                 self.session = nil
                 self.livePhotoOutput = nil     // 用完即弃，下次实况再新建
