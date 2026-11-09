@@ -46,7 +46,34 @@ final class CameraEngine: NSObject, ObservableObject {
     @Published private(set) var lastFireTime: String = "--"
 
     // MARK: - 取景画面（后置摄像头实时预览）
-    let previewLayer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: AVCaptureSession())
+    // 图层由界面上的 PreviewView 创建（苹果官方做法），引擎只负责把摄像头接上去
+    private weak var previewLayer: AVCaptureVideoPreviewLayer?
+    private var previewPort: AVCaptureInput.Port?
+    private var previewMirrored = false
+
+    /// 界面上的预览图层就绪后调用；可重复调用，内部幂等
+    func attachPreview(_ layer: AVCaptureVideoPreviewLayer) {
+        layer.videoGravity = .resizeAspectFill
+        if previewLayer === layer, layer.connection != nil { return }
+        previewLayer = layer
+        configurePreviewIfPossible()
+    }
+
+    private func configurePreviewIfPossible() {
+        guard let layer = previewLayer, let s = session, let port = previewPort else { return }
+        let needsConfig = s.isRunning
+        if needsConfig { s.beginConfiguration() }
+        if layer.session !== s { layer.setSessionWithNoConnection(s) }
+        if layer.connection == nil {
+            let c = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
+            if s.canAddConnection(c) {
+                s.addConnection(c)
+                c.videoRotationAngle = 90
+                c.isVideoMirrored = previewMirrored
+            }
+        }
+        if needsConfig { s.commitConfiguration() }
+    }
 
     // MARK: - 私有
     private var session: AVCaptureSession?
@@ -166,8 +193,8 @@ final class CameraEngine: NSObject, ObservableObject {
 
         var dual = false
         // 预览用哪一个摄像头的画面：有后摄就显示后摄（产品那边），否则显示前摄
-        var previewPort: AVCaptureInput.Port?
-        var previewMirrored = false
+        previewPort = nil
+        previewMirrored = false
 
         if multiOK, let rear = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
            s.canAddInput(frontInput) {
@@ -208,21 +235,12 @@ final class CameraEngine: NSObject, ObservableObject {
             previewMirrored = true
         }
 
-        // 取景画面：多摄/单摄都必须手动建立预览连接
-        previewLayer.videoGravity = .resizeAspectFill
-        previewLayer.setSessionWithNoConnection(s)
-        if let port = previewPort {
-            let c = AVCaptureConnection(inputPort: port, videoPreviewLayer: previewLayer)
-            if s.canAddConnection(c) {
-                s.addConnection(c)
-                c.videoRotationAngle = 90
-                c.isVideoMirrored = previewMirrored
-            }
-        }
-
-        s.commitConfiguration()
         session = s
         dualCamera = dual
+        // 取景画面：界面上的图层如果已经就绪，这里把摄像头接上
+        configurePreviewIfPossible()
+
+        s.commitConfiguration()
     }
 
     // MARK: - 权限

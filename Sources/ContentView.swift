@@ -21,36 +21,32 @@ struct NodShotApp: App {
 }
 
 // MARK: - 取景画面（后置摄像头的实时预览）
-final class PreviewHostView: UIView {
-    private let previewLayer: AVCaptureVideoPreviewLayer
+final class PreviewView: UIView {
+    override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
 
-    init(previewLayer: AVCaptureVideoPreviewLayer) {
-        self.previewLayer = previewLayer
-        super.init(frame: .zero)
+    var videoLayer: AVCaptureVideoPreviewLayer { layer as! AVCaptureVideoPreviewLayer }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
         backgroundColor = .black
-        clipsToBounds = true
-        layer.addSublayer(previewLayer)
+        videoLayer.videoGravity = .resizeAspectFill
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        previewLayer.frame = bounds
-        CATransaction.commit()
-    }
 }
 
 struct CameraPreviewView: UIViewRepresentable {
-    let previewLayer: AVCaptureVideoPreviewLayer
+    let engine: CameraEngine
 
-    func makeUIView(context: Context) -> PreviewHostView {
-        PreviewHostView(previewLayer: previewLayer)
+    func makeUIView(context: Context) -> PreviewView {
+        let view = PreviewView()
+        engine.attachPreview(view.videoLayer)
+        return view
     }
 
-    func updateUIView(_ uiView: PreviewHostView, context: Context) {}
+    func updateUIView(_ uiView: PreviewView, context: Context) {
+        engine.attachPreview(uiView.videoLayer)
+    }
 }
 
 struct ContentView: View {
@@ -81,7 +77,7 @@ struct ContentView: View {
     private var previewCard: some View {
         VStack(alignment: .leading, spacing: 8) {
             ZStack {
-                CameraPreviewView(previewLayer: engine.previewLayer)
+                CameraPreviewView(engine: engine)
                     .aspectRatio(3.0 / 4.0, contentMode: .fit)
                     .background(Color.black)
                     .clipShape(RoundedRectangle(cornerRadius: 16))
