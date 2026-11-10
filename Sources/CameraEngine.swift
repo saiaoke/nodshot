@@ -94,7 +94,9 @@ final class CameraEngine: NSObject, ObservableObject {
     private func detachPreviewFromSession(_ s: AVCaptureSession) {
         DispatchQueue.main.sync {
             if let layer = self.previewLayer, layer.session === s {
-                layer.setSessionWithNoConnection(nil)
+                // ⚠️ 不能用 setSessionWithNoConnection(nil)——它的参数是非可选的，传 nil 编译报错。
+                //    session 属性是可选的，置 nil 即可解绑
+                layer.session = nil
             }
         }
     }
@@ -189,7 +191,7 @@ final class CameraEngine: NSObject, ObservableObject {
                 DispatchQueue.main.sync {
                     if let cur = self.session {
                         if let layer = self.previewLayer, layer.session === cur {
-                            layer.setSessionWithNoConnection(nil)   // ⚠️ 解绑预览（v8）
+                            layer.session = nil   // ⚠️ 解绑预览（v8；参数非可选不能传 nil 给 setSessionWithNoConnection）
                         }
                         if cur.isRunning { cur.stopRunning() }
                         cur.beginConfiguration()
