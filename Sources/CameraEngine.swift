@@ -108,6 +108,8 @@ final class CameraEngine: NSObject, ObservableObject {
     private let analysisQueue = DispatchQueue(label: "nodshot.analysis", qos: .userInitiated)
     private let faceRequest = VNDetectFaceLandmarksRequest()
     private var lastAnalyze: CFAbsoluteTime = 0
+    /// 最后一帧到达的时间（画面冻结检测用，v11）
+    private var lastFrameTime: CFAbsoluteTime = 0
 
     private var baselineY: Double?      // 中性姿态时脸的垂直中心（自动标定）
     private var baselineH: Double = 0.3 // 中性姿态时脸的高度
@@ -223,10 +225,27 @@ final class CameraEngine: NSObject, ObservableObject {
                 if ok && self.livePhoto && !self.livePhotoSupported {
                     self.hint = "已启动（此配置不支持实况，拍普通照片）"
                 }
+                if ok { self.scheduleStallWatchdog() }
             }
         }
         requestPhotoPermission()
         UIApplication.shared.isIdleTimerDisabled = true
+    }
+
+    /// v11 画面冻结检测：启动 6 秒后检查一次帧流，超过 5 秒没有任何帧
+    /// → 画面卡死了 → 自动重启相机。正常则继续守着（每 6 秒一轮巡逻）
+    private func scheduleStallWatchdog() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self else { return }
+            guard self.wantRunning, self.running, !self.liveCaptureBusy else { return }
+            let idle = CFAbsoluteTimeGetCurrent() - self.lastFrameTime
+            if self.lastFrameTime > 0, idle > 5 {
+                self.hint = "画面卡住了，正在自动重启相机…（无需操作）"
+                self.rebuildSession()
+            } else {
+                self.scheduleStallWatchdog()   // 一切正常，继续巡逻
+            }
+        }
     }
 
     func stop() {
@@ -246,8 +265,11 @@ final class CameraEngine: NSObject, ObservableObject {
     }
 
     /// 切换实况开关后需要重建 session（实况必须在 startRunning 之前配置）
+    private var rebuilding = false
     private func rebuildSession() {
+        guard !rebuilding else { return }   // 已经在重建中，别叠加（v11）
         guard let old = session else { return }
+        rebuilding = true
         running = false
         faceVisible = false
         hint = "正在重启相机…"
@@ -260,6 +282,7 @@ final class CameraEngine: NSObject, ObservableObject {
             old.commitConfiguration()
             usleep(1_500_000)   // 等摄像头真正释放（v8）
             DispatchQueue.main.async {
+                self.rebuilding = false
                 self.session = nil
                 self.start()
             }
@@ -284,10 +307,10 @@ final class CameraEngine: NSObject, ObservableObject {
         let multiOK = AVCaptureMultiCamSession.isMultiCamSupported
         let s: AVCaptureSession = multiOK ? AVCaptureMultiCamSession() : AVCaptureSession()
         s.beginConfiguration()
-        // ⚠️ v8：给多摄会话也设 .photo 预设（v5 教训：默认预设下照片输出不支持实况）。
-        //    如果设上后双摄直接支持实况 → 点头后无需切单摄、无需重启相机，
-        //    "拍完启动不了"的问题从根上消失。canSetSessionPreset 先问（不支持就设会抛异常）
-        if s.canSetSessionPreset(.photo) { s.sessionPreset = .photo }
+        // ⚠️ v11 回退：v8 曾实验给多摄会话设 .photo 预设（想让双摄直拍实况），
+        //    但实测会让相机硬件进入不稳定状态：画面出来几秒后整路数据流卡死（v10 用户复现）。
+        //    多摄会话保持默认预设（v6 验证过最稳定），实况统一走「自动切单摄」路线。
+        //    教训：多摄会话不要动预设，也不要在双摄 photoOutput 上开实况。
 
         guard let front = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
             s.commitConfiguration()
@@ -349,14 +372,9 @@ final class CameraEngine: NSObject, ObservableObject {
 
         s.commitConfiguration()
 
-        // ⚠️ 支持性必须在 commitConfiguration 之后查询（配置块内恒为 false，已踩坑）
-        //    注意：双摄多摄会话大概率仍然真不支持实况，这里修正后能查到真实值
-        if dual && photoOutput.isLivePhotoCaptureSupported {
-            photoOutput.isLivePhotoCaptureEnabled = livePhoto
-            livePhotoSupported = true
-        } else {
-            livePhotoSupported = false
-        }
+        // ⚠️ v11：双摄会话一律不启用实况（v8 实验证明这会 destabilize 相机导致画面卡死）。
+        //    开实况时 fire() 会自动切单摄拍真·实况，那条路已被验证稳定可靠
+        livePhotoSupported = false
     }
 
     // MARK: - 权限
@@ -626,6 +644,7 @@ extension CameraEngine: AVCaptureVideoDataOutputSampleBufferDelegate {
                        from connection: AVCaptureConnection) {
 
         let now = CFAbsoluteTimeGetCurrent()
+        lastFrameTime = now
         guard now - lastAnalyze > 0.04 else { return }   // 约 25 次/秒，够用又不烫
         lastAnalyze = now
 

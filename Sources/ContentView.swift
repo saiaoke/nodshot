@@ -310,7 +310,7 @@ struct ContentView: View {
                     .font(.headline)
                 Text("上次触发 \(engine.lastFireTime) · 照片已存入「最近项目」")
                     .font(.caption).foregroundStyle(.secondary)
-                Text("版本 v10（修复假运行状态骗过看门狗 → 拍完自动恢复）")
+                Text("版本 v11（回退双摄实验配置修卡死 + 冻结自动重启 + 拍完自动恢复）")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
             Spacer()
