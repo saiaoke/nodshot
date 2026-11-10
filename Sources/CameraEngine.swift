@@ -421,6 +421,13 @@ final class CameraEngine: NSObject, ObservableObject {
     private func captureLiveViaSingleCam() {
         guard !liveCaptureBusy, let old = session else { return }
         liveCaptureBusy = true
+        // ⚠️ 立刻把「运行中」标记关掉：双摄会话马上就要停了。
+        //    v9 的教训：不改这个标记，看门狗看到 running==true 会以为相机好好的，
+        //    直接放弃恢复 → 拍完后永远卡在黑屏 +「正在恢复相机…」（已踩坑）
+        running = false
+        faceVisible = false
+        nodRatio = 0
+        mouthRatio = 0
         DispatchQueue.main.async {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         }
@@ -548,6 +555,8 @@ final class CameraEngine: NSObject, ObservableObject {
             }
             usleep(1_500_000)   // 等系统真正释放摄像头（此时 session 已无引用，释放是真实发生的）
             DispatchQueue.main.async {
+                self.running = false            // 恢复前状态归零，看门狗才能看到「需要恢复」
+                self.faceVisible = false
                 self.livePhotoOutput = nil     // 用完即弃，下次实况再新建
                 self.liveCaptureBusy = false
                 self.baselineY = nil        // 相机换了，重新标定基线
